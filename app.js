@@ -72,6 +72,8 @@ function openSettings() {
 }
 function showProv() { const g = $("sProv").value === "gemini"; $("boxG").hidden = !g; $("boxO").hidden = g; }
 $("sProv").onchange = showProv;
+$("btnMedPreset").onclick = () => { $("sTopic").value = DEFAULTS.topic; $("sGloss").value = DEFAULTS.gloss; };
+$("btnClearPreset").onclick = () => { $("sTopic").value = ""; $("sGloss").value = ""; };
 const curKey = () => (S.provider === "gemini" ? S.gkey : S.key);
 const provName = () => (S.provider === "gemini" ? "Gemini" : "OpenAI");
 $("dlg").addEventListener("close", () => {
@@ -266,7 +268,7 @@ async function transcribe(blob, prev) {
 }
 
 function rules() {
-  return "使用台灣繁體中文與台灣醫學慣用譯名（例如：乳癌、化療、放射治療）。句子不完整時照實翻出已有部分，不要自行補完。" +
+  return "使用台灣繁體中文與台灣慣用譯名（依會議主題選用該領域的專業用語）。句子不完整時照實翻出已有部分，不要自行補完。" +
     (S.gloss ? "\n專有名詞請優先使用以下對照（原文拼字或發音可能略有出入，請依發音辨認）：\n" + glossPairs().map(p => p.join(" = ")).join("\n") : "") +
     (S.topic ? "\n會議主題：" + S.topic : "");
 }
@@ -274,15 +276,41 @@ function rules() {
 // Gemini: one call does both transcription and translation of the audio segment.
 const THINK = [{ thinkingBudget: 0 }, { thinkingLevel: "minimal" }, null];
 let gThink = 0, gSchema = true;
+// When a model is overloaded (503 / "high demand"), skip it for a while and use the next one.
+const GFALLBACK = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-4-hydrogen"];
+const gBusyUntil = {};
+const isBusy = e => e.status === 503 || e.status === 500 || e.status === 502 || e.status === 504 ||
+  (e.status === 429 && /demand|overload|unavailable|try again later/i.test(e.message));
 function b64(blob) {
   return new Promise((ok, no) => { const fr = new FileReader(); fr.onload = () => ok(fr.result.split(",")[1]); fr.onerror = no; fr.readAsDataURL(blob); });
 }
 async function geminiSegment(blob, hist) {
   const src = LANG_NAME[S.lang] || "外語";
-  const system = `你是專業的醫學會議口譯員。你會收到一段${src}演講錄音：先逐字聽寫原文（${src}），再翻譯成台灣繁體中文。` + rules() +
+  const system = `你是專業的會議口譯員。你會收到一段${src}演講錄音：先逐字聽寫原文（${src}），再翻譯成台灣繁體中文。` + rules() +
     '\n以 JSON 回答：{"src": "原文聽寫", "zh": "中文翻譯"}。錄音中沒有可辨識的語音（只有噪音、掌聲、靜音）時，兩者都回空字串，不要編造內容。';
   const ctx = hist.length ? "前文（只供上下文參考，不要再翻譯）：\n" + hist.map(([a, b]) => a + "\n→ " + b).join("\n") + "\n\n" : "";
   const data = await b64(blob);
+  const now = Date.now();
+  const models = [S.gmodel, ...GFALLBACK.filter(m => m !== S.gmodel)];
+  const order = models.filter(m => !(gBusyUntil[m] > now)).concat(models.filter(m => gBusyUntil[m] > now));
+  let lastErr;
+  for (let round = 0; round < 2; round++) {
+    for (const model of order) {
+      try {
+        const r = await geminiCall(model, system, ctx, data);
+        if (model !== S.gmodel) setStatus(`${S.gmodel} 忙碌中，暫時改用 ${model}`);
+        return r;
+      } catch (e) {
+        lastErr = e;
+        if (!isBusy(e)) throw e;
+        gBusyUntil[model] = Date.now() + 120000;
+      }
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  throw lastErr;
+}
+async function geminiCall(model, system, ctx, data) {
   for (;;) {
     const gc = { responseMimeType: "application/json" };
     if (gSchema) gc.responseSchema = { type: "OBJECT", properties: { src: { type: "STRING" }, zh: { type: "STRING" } }, required: ["src", "zh"] };
@@ -290,13 +318,13 @@ async function geminiSegment(blob, hist) {
     const body = { systemInstruction: { parts: [{ text: system }] }, generationConfig: gc,
       contents: [{ role: "user", parts: [{ text: ctx + "請聽寫並翻譯這段錄音：" }, { inline_data: { mime_type: "audio/wav", data } }] }] };
     let j;
-    try { j = await (await api(`/models/${encodeURIComponent(S.gmodel)}:generateContent`, body, false, true)).json(); }
+    try { j = await (await api(`/models/${encodeURIComponent(model)}:generateContent`, body, false, true)).json(); }
     catch (e) {
       if (e.status === 400 && /think/i.test(e.message) && THINK[gThink]) { gThink++; continue; }
       if (e.status === 400 && /schema/i.test(e.message) && gSchema) { gSchema = false; continue; }
       throw e;
     }
-    const u = j.usageMetadata || {}, pr = GPRICE[S.gmodel] || GPRICE["gemini-3.8-flash"];
+    const u = j.usageMetadata || {}, pr = GPRICE[model] || GPRICE["gemini-3.8-flash"];
     addCost(((u.promptTokenCount || 0) * pr[0] + ((u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0)) * pr[1]) / 1e6);
     const txt = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || "").join("").trim();
     try { const o = JSON.parse(txt.replace(/^```(json)?|```$/g, "")); return { de: (o.src || "").trim(), zh: (o.zh || "").trim() }; }
@@ -306,7 +334,7 @@ async function geminiSegment(blob, hist) {
 
 let mtNoEffort = false;
 async function translate(text) {
-  const system = `你是專業的醫學會議口譯員。把使用者給的${LANG_NAME[S.lang] || "外語"}演講語音辨識稿翻譯成台灣繁體中文。` +
+  const system = `你是專業的會議口譯員。把使用者給的${LANG_NAME[S.lang] || "外語"}演講語音辨識稿翻譯成台灣繁體中文。` +
     "語音辨識可能有錯字，請依上下文推斷正確的專業術語。只輸出譯文本身，不要解釋、不要加引號、不要重複原文。" + rules();
   const messages = [{ role: "system", content: system }];
   for (const [a, b] of history.slice(-4)) messages.push({ role: "user", content: a }, { role: "assistant", content: b });
@@ -326,6 +354,7 @@ async function translate(text) {
 
 function friendly(e) {
   if (e.status === 401) return "金鑰無效，請到設定檢查";
+  if (isBusy(e)) return "Google 的 Gemini 模型目前都很忙，請稍後再試，或在設定改選其他模型";
   if (e.status === 429) return `${provName()} 用量上限或額度不足（429）`;
   if (e.status === 403) return `${provName()} 拒絕存取（403）：檢查金鑰權限或是否已開通付費`;
   if (e.status === 404) return "找不到模型，請到設定→進階檢查模型名稱";
