@@ -5,10 +5,13 @@
 // Test hook: only on localhost, "?mock" points the app at a local mock server instead of OpenAI.
 const MOCK = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && new URLSearchParams(location.search).has("mock");
 const API = MOCK ? location.origin + "/v1" : "https://api.openai.com/v1";
+const GAPI = MOCK ? location.origin + "/v1beta" : "https://generativelanguage.googleapis.com/v1beta";
+// USD per 1M tokens [input(audio), output]; Google AI Studio pricing checked 2026-11-20 (3.6/3.8 Flash double on 2027-01-01).
+const GPRICE = { "gemini-3.8-flash": [0.75, 3.75], "gemini-3.6-flash": [0.75, 3.75], "gemini-3.5-flash-lite": [0.30, 2.50], "gemini-4-hydrogen": [1.5, 7.5] };
 const PRICE = { asrPerMin: 0.0045, inPerM: 1.0, outPerM: 5.0 }; // gpt-transcribe / gpt-6.1-terra, checked 2026-11-20
 
 const DEFAULTS = {
-  key: "", lang: "de", asr: "gpt-transcribe", mt: "gpt-6.1-terra", effort: "none", sil: 700, font: 22,
+  provider: "gemini", gkey: "", gmodel: "gemini-3.8-flash", key: "", lang: "de", asr: "gpt-transcribe", mt: "gpt-6.1-terra", effort: "none", sil: 700, font: 22,
   topic: "Vortrag auf einem medizinischen Kongress über Brustkrebs, Mammakarzinom, Onkologie, neoadjuvante " +
     "Chemotherapie, brusterhaltende Operation, Mastektomie, triple-negativ, HER2-positiv, pathologische Komplettremission, Studie.",
   gloss: [
@@ -62,13 +65,19 @@ function applySettingsUI() {
 $("btnDe").onclick = () => { S.hideDe = !S.hideDe; localStorage.setItem("dz.settings", JSON.stringify(S)); applySettingsUI(); };
 $("btnSettings").onclick = openSettings;
 function openSettings() {
+  $("sProv").value = S.provider; $("sGkey").value = S.gkey; $("sGmodel").value = S.gmodel; showProv();
   $("sKey").value = S.key; $("sLang").value = S.lang; $("sTopic").value = S.topic; $("sGloss").value = S.gloss;
   $("sFont").value = S.font; $("sAsr").value = S.asr; $("sMt").value = S.mt; $("sEffort").value = S.effort; $("sSil").value = S.sil;
   $("dlg").showModal();
 }
+function showProv() { const g = $("sProv").value === "gemini"; $("boxG").hidden = !g; $("boxO").hidden = g; }
+$("sProv").onchange = showProv;
+const curKey = () => (S.provider === "gemini" ? S.gkey : S.key);
+const provName = () => (S.provider === "gemini" ? "Gemini" : "OpenAI");
 $("dlg").addEventListener("close", () => {
   if ($("dlg").returnValue !== "save") return;
   Object.assign(S, {
+    provider: $("sProv").value, gkey: $("sGkey").value.trim(), gmodel: $("sGmodel").value.trim() || DEFAULTS.gmodel,
     key: $("sKey").value.trim(), lang: $("sLang").value, topic: $("sTopic").value.trim(), gloss: $("sGloss").value.trim(),
     font: +$("sFont").value, asr: $("sAsr").value.trim() || DEFAULTS.asr, mt: $("sMt").value.trim() || DEFAULTS.mt,
     effort: $("sEffort").value, sil: Math.max(300, +$("sSil").value || DEFAULTS.sil),
@@ -113,7 +122,7 @@ const SR = 16000, FRAME = 320; // 20 ms frames
 let pcm = [], pending = new Float32Array(0), noise = 0.004, voiced = 0, silent = 0, inSeg = false, preroll = [];
 
 async function start() {
-  if (!S.key) { setStatus("請先在設定填入 OpenAI API 金鑰", true); return openSettings(); }
+  if (!curKey()) { setStatus(`請先在設定填入 ${provName()} API 金鑰`, true); return openSettings(); }
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
     ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -208,14 +217,15 @@ function wav(samples) {
 }
 
 // ------------------------------------------------------------------ OpenAI calls
-async function api(path, body, isForm) {
-  const r = await fetch(API + path, {
+async function api(path, body, isForm, gemini) {
+  const auth = gemini ? { "x-goog-api-key": S.gkey } : { Authorization: "Bearer " + S.key };
+  const r = await fetch((gemini ? GAPI : API) + path, {
     method: "POST", body: isForm ? body : JSON.stringify(body),
-    headers: Object.assign({ Authorization: "Bearer " + S.key }, isForm ? {} : { "Content-Type": "application/json" }),
+    headers: Object.assign(auth, isForm ? {} : { "Content-Type": "application/json" }),
   });
   if (!r.ok) {
     let msg = r.status + ""; try { msg = (await r.json()).error?.message || msg; } catch (_) {}
-    const err = new Error(msg); err.status = r.status; throw err;
+    const err = new Error(msg); err.status = /api key not valid|API_KEY_INVALID/i.test(msg) ? 401 : r.status; throw err;
   }
   return r;
 }
@@ -255,14 +265,49 @@ async function transcribe(blob, prev) {
   throw new Error("語音辨識參數不相容");
 }
 
+function rules() {
+  return "使用台灣繁體中文與台灣醫學慣用譯名（例如：乳癌、化療、放射治療）。句子不完整時照實翻出已有部分，不要自行補完。" +
+    (S.gloss ? "\n專有名詞請優先使用以下對照（原文拼字或發音可能略有出入，請依發音辨認）：\n" + glossPairs().map(p => p.join(" = ")).join("\n") : "") +
+    (S.topic ? "\n會議主題：" + S.topic : "");
+}
+
+// Gemini: one call does both transcription and translation of the audio segment.
+const THINK = [{ thinkingBudget: 0 }, { thinkingLevel: "minimal" }, null];
+let gThink = 0, gSchema = true;
+function b64(blob) {
+  return new Promise((ok, no) => { const fr = new FileReader(); fr.onload = () => ok(fr.result.split(",")[1]); fr.onerror = no; fr.readAsDataURL(blob); });
+}
+async function geminiSegment(blob, hist) {
+  const src = LANG_NAME[S.lang] || "外語";
+  const system = `你是專業的醫學會議口譯員。你會收到一段${src}演講錄音：先逐字聽寫原文（${src}），再翻譯成台灣繁體中文。` + rules() +
+    '\n以 JSON 回答：{"src": "原文聽寫", "zh": "中文翻譯"}。錄音中沒有可辨識的語音（只有噪音、掌聲、靜音）時，兩者都回空字串，不要編造內容。';
+  const ctx = hist.length ? "前文（只供上下文參考，不要再翻譯）：\n" + hist.map(([a, b]) => a + "\n→ " + b).join("\n") + "\n\n" : "";
+  const data = await b64(blob);
+  for (;;) {
+    const gc = { responseMimeType: "application/json" };
+    if (gSchema) gc.responseSchema = { type: "OBJECT", properties: { src: { type: "STRING" }, zh: { type: "STRING" } }, required: ["src", "zh"] };
+    if (THINK[gThink]) gc.thinkingConfig = THINK[gThink];
+    const body = { systemInstruction: { parts: [{ text: system }] }, generationConfig: gc,
+      contents: [{ role: "user", parts: [{ text: ctx + "請聽寫並翻譯這段錄音：" }, { inline_data: { mime_type: "audio/wav", data } }] }] };
+    let j;
+    try { j = await (await api(`/models/${encodeURIComponent(S.gmodel)}:generateContent`, body, false, true)).json(); }
+    catch (e) {
+      if (e.status === 400 && /think/i.test(e.message) && THINK[gThink]) { gThink++; continue; }
+      if (e.status === 400 && /schema/i.test(e.message) && gSchema) { gSchema = false; continue; }
+      throw e;
+    }
+    const u = j.usageMetadata || {}, pr = GPRICE[S.gmodel] || GPRICE["gemini-3.8-flash"];
+    addCost(((u.promptTokenCount || 0) * pr[0] + ((u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0)) * pr[1]) / 1e6);
+    const txt = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || "").join("").trim();
+    try { const o = JSON.parse(txt.replace(/^```(json)?|```$/g, "")); return { de: (o.src || "").trim(), zh: (o.zh || "").trim() }; }
+    catch (_) { return { de: "", zh: txt }; }
+  }
+}
+
 let mtNoEffort = false;
 async function translate(text) {
-  const src = LANG_NAME[S.lang] || "外語";
-  const system = `你是專業的醫學會議口譯員。把使用者給的${src}演講語音辨識稿翻譯成台灣繁體中文，使用台灣醫學慣用譯名（例如：乳癌、化療、放射治療）。` +
-    "語音辨識可能有錯字或斷句不完整，請依上下文推斷正確的專業術語；句子不完整時照實翻出已有部分，不要自行補完。" +
-    "只輸出譯文本身，不要解釋、不要加引號、不要重複原文。" +
-    (S.gloss ? "\n專有名詞請優先使用以下對照（拼字可能因語音辨識而有誤，請依發音辨認）：\n" + glossPairs().map(p => p.join(" = ")).join("\n") : "") +
-    (S.topic ? "\n會議主題：" + S.topic : "");
+  const system = `你是專業的醫學會議口譯員。把使用者給的${LANG_NAME[S.lang] || "外語"}演講語音辨識稿翻譯成台灣繁體中文。` +
+    "語音辨識可能有錯字，請依上下文推斷正確的專業術語。只輸出譯文本身，不要解釋、不要加引號、不要重複原文。" + rules();
   const messages = [{ role: "system", content: system }];
   for (const [a, b] of history.slice(-4)) messages.push({ role: "user", content: a }, { role: "assistant", content: b });
   messages.push({ role: "user", content: text });
@@ -281,7 +326,8 @@ async function translate(text) {
 
 function friendly(e) {
   if (e.status === 401) return "金鑰無效，請到設定檢查";
-  if (e.status === 429) return "OpenAI 用量上限或額度不足（429）";
+  if (e.status === 429) return `${provName()} 用量上限或額度不足（429）`;
+  if (e.status === 403) return `${provName()} 拒絕存取（403）：檢查金鑰權限或是否已開通付費`;
   if (e.status === 404) return "找不到模型，請到設定→進階檢查模型名稱";
   if (e instanceof TypeError) return "網路連線失敗";
   return "錯誤：" + e.message;
@@ -299,6 +345,21 @@ async function withRetry(fn) {
 function handleSegment(samples) {
   const row = { t: Date.now() };
   rows.push(row); renderRow(row);
+  if (S.provider === "gemini") {
+    const p = withRetry(() => geminiSegment(wav(samples), history.slice(-3)));
+    p.catch(() => {});
+    chain = chain.then(async () => {
+      try {
+        const { de, zh } = await p;
+        if ((!de && !zh) || (de && JUNK.some(rx => rx.test(de)))) { rows.splice(rows.indexOf(row), 1); row.el?.remove(); return; }
+        Object.assign(row, { de, zh });
+        history.push([de, zh]); if (history.length > 20) history.shift();
+        if (running) setStatus("收音中…");
+      } catch (e) { row.err = friendly(e); setStatus(row.err, true); }
+      renderRow(row); saveRows();
+    });
+    return;
+  }
   const prev = history.slice(-2).map(h => h[0]).join(" ");
   addCost(samples.length / SR / 60 * PRICE.asrPerMin);
   const asrP = withRetry(() => transcribe(wav(samples), prev));
@@ -321,10 +382,11 @@ function handleSegment(samples) {
 // ------------------------------------------------------------------ boot
 applySettingsUI(); renderAll(); showCost();
 history = rows.filter(r => r.de && r.zh).slice(-4).map(r => [r.de, r.zh]);
-if (!S.key) setStatus("第一次使用：請按 ⚙️ 填入 OpenAI API 金鑰");
+if (!curKey()) setStatus("第一次使用：請按 ⚙️ 填入 API 金鑰");
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 if (MOCK) {
-  S.key = S.key || "mock";
+  S.key = S.key || "mock"; S.gkey = S.gkey || "mock";
+  if (new URLSearchParams(location.search).get("mock") === "openai") S.provider = "openai";
   if (location.hash === "#autostart") setTimeout(start, 300);
   setInterval(() => fetch("/mock-report", { method: "POST", body: JSON.stringify({ status: $("status").textContent, cost: $("cost").textContent,
     rows: rows.map(r => ({ de: r.de, zh: r.zh, err: r.err })) }) }).catch(() => {}), 2000);

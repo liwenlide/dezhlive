@@ -63,9 +63,24 @@
 <dialog id="dlg">
   <form method="dialog">
     <h2 style="margin:0 0 4px;font-size:18px">設定</h2>
-    <label>OpenAI API 金鑰</label>
-    <input id="sKey" type="password" autocomplete="off" placeholder="sk-...">
-    <div class="hint">只存在這支手機的瀏覽器裡，直接送到 OpenAI，不經過其他伺服器。建議在 OpenAI 後台建一把專用金鑰並設每月上限。</div>
+    <label>服務</label>
+    <select id="sProv"><option value="gemini">Google Gemini</option><option value="openai">OpenAI</option></select>
+    <div id="boxG">
+      <label>Gemini API 金鑰</label>
+      <input id="sGkey" type="password" autocomplete="off" placeholder="AIza...">
+      <div class="hint">到 aistudio.google.com 建立。請用已開通付費（含 Google AI Pro 每月額度）的專案：免費方案的內容會被 Google 用來改進產品。</div>
+      <label>Gemini 模型</label>
+      <select id="sGmodel">
+        <option value="gemini-3.8-flash">gemini-3.8-flash（建議，品質好）</option>
+        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite（最便宜、最快）</option>
+        <option value="gemini-4-hydrogen">gemini-4-hydrogen（最新，較貴）</option>
+      </select>
+    </div>
+    <div id="boxO">
+      <label>OpenAI API 金鑰</label>
+      <input id="sKey" type="password" autocomplete="off" placeholder="sk-...">
+    </div>
+    <div class="hint">金鑰只存在這支手機的瀏覽器裡，直接送到該服務，不經過其他伺服器。建議設每月花費上限。</div>
     <label>演講語言</label>
     <select id="sLang">
       <option value="de">德文</option><option value="en">英文</option><option value="fr">法文</option>
@@ -79,7 +94,7 @@
     <label>字體大小</label>
     <input id="sFont" type="range" min="16" max="34" step="1">
     <details style="margin-top:12px">
-      <summary style="color:var(--muted);font-size:13px">進階：模型</summary>
+      <summary style="color:var(--muted);font-size:13px">進階：OpenAI 模型與斷句</summary>
       <label>語音辨識模型</label><input id="sAsr">
       <label>翻譯模型</label><input id="sMt">
       <label>翻譯推理強度（none 最快）</label>
