@@ -22,6 +22,21 @@ const DEFAULTS = {
     "Gesamtüberleben=整體存活期", "progressionsfreies Überleben=無惡化存活期", "Patientinnen=病人",
   ].join("\n"),
 };
+const PRESET_DH = {
+  topic: "Startup-Pitch und Diskussion über Digital Health: digitale Gesundheitsanwendungen (DiGA), Medizinprodukte, " +
+    "Finanzierung, Investoren, Gründer, Markteintritt, Erstattung durch Krankenkassen, Datenschutz, KI im Gesundheitswesen.",
+  gloss: [
+    "Digitale Gesundheitsanwendung (DiGA)=數位健康應用（DiGA）", "DiPA=數位照護應用（DiPA）", "BfArM=德國聯邦藥品與醫療器材管理局（BfArM）",
+    "Fast-Track-Verfahren=快速審查程序", "Erstattung=給付", "Krankenkasse / GKV=健保（法定健康保險）", "Leistungserbringer=醫療服務提供者",
+    "elektronische Patientenakte (ePA)=電子病歷（ePA）", "E-Rezept=電子處方", "Telematikinfrastruktur (TI)=遠距資訊基礎設施（TI）",
+    "Medizinprodukt=醫療器材", "MDR=歐盟醫療器材法規（MDR）", "CE-Kennzeichnung=CE 標章", "Zertifizierung=認證", "klinische Studie=臨床試驗",
+    "Evidenz=實證", "Versorgung=醫療照護", "Datenschutz / DSGVO=資料保護／GDPR", "Gründer / Gründerin=創辦人", "Gründung=創業",
+    "Startup=新創", "Pitch=簡報提案（pitch）", "Investor=投資人", "Business Angel=天使投資人", "Risikokapital / Venture Capital=創投",
+    "Finanzierungsrunde=募資輪", "Seed=種子輪", "Series A=A 輪", "Bewertung=估值", "Förderung / Fördermittel=補助（政府資助）",
+    "Inkubator=育成中心", "Accelerator=加速器", "Geschäftsmodell=商業模式", "Markteintritt=進入市場", "Umsatz=營收", "skalieren=規模化",
+    "Kunde=客戶", "Nutzer=使用者", "Schnittstelle=介面（API）", "Künstliche Intelligenz (KI)=人工智慧（AI）",
+  ].join("\n"),
+};
 const LANG_NAME = { de: "德文", en: "英文", fr: "法文", es: "西班牙文", it: "義大利文", nl: "荷蘭文", ja: "日文", ko: "韓文" };
 // Phrases speech models tend to hallucinate on silence/noise.
 const JUNK = [/untertitel/i, /amara\.org/i, /vielen dank für(s| das) zuschauen/i, /^\W*$/, /^(\s*(ja|äh|ähm|mhm)[.,!?\s]*)+$/i,
@@ -73,6 +88,7 @@ function openSettings() {
 function showProv() { const g = $("sProv").value === "gemini"; $("boxG").hidden = !g; $("boxO").hidden = g; }
 $("sProv").onchange = showProv;
 $("btnMedPreset").onclick = () => { $("sTopic").value = DEFAULTS.topic; $("sGloss").value = DEFAULTS.gloss; };
+$("btnDhPreset").onclick = () => { $("sTopic").value = PRESET_DH.topic; $("sGloss").value = PRESET_DH.gloss; };
 $("btnClearPreset").onclick = () => { $("sTopic").value = ""; $("sGloss").value = ""; };
 const curKey = () => (S.provider === "gemini" ? S.gkey : S.key);
 const provName = () => (S.provider === "gemini" ? "Gemini" : "OpenAI");
@@ -121,7 +137,7 @@ function keywords() {
 
 // ------------------------------------------------------------------ audio capture + VAD
 const SR = 16000, FRAME = 320; // 20 ms frames
-let pcm = [], pending = new Float32Array(0), noise = 0.004, voiced = 0, silent = 0, inSeg = false, preroll = [];
+let lv = [], pcm = [], pending = new Float32Array(0), noise = 0.004, voiced = 0, silent = 0, inSeg = false, preroll = [];
 
 async function start() {
   if (!curKey()) { setStatus(`請先在設定填入 ${provName()} API 金鑰`, true); return openSettings(); }
@@ -174,7 +190,7 @@ function downsample(x, ratio) {
   }
   return out;
 }
-function resetSeg() { pcm = []; voiced = 0; silent = 0; inSeg = false; }
+function resetSeg() { pcm = []; lv = []; voiced = 0; silent = 0; inSeg = false; }
 
 function onAudio(chunk) {
   const buf = new Float32Array(pending.length + chunk.length);
@@ -192,13 +208,30 @@ function frame(f) {
   const copy = f.slice(0);
   if (!inSeg) {
     preroll.push(copy); if (preroll.length > 15) preroll.shift(); // 300 ms pre-roll
-    if (speech) { inSeg = true; pcm = preroll.splice(0); voiced = 1; silent = 0; }
+    if (speech) { inSeg = true; pcm = preroll.splice(0); lv = pcm.map(() => 0); voiced = 1; silent = 0; }
     return;
   }
-  pcm.push(copy);
+  pcm.push(copy); lv.push(rms);
   if (speech) { voiced++; silent = 0; } else silent++;
   const secs = pcm.length * 0.02;
-  if ((silent * 20 >= S.sil && secs >= 1.5) || secs >= 14 || (silent * 20 >= 2000)) flushSeg();
+  // Normal end: a pause. After 7 s, a short breath (250 ms) is enough, so long talks are split at natural gaps.
+  if ((silent * 20 >= S.sil && secs >= 1.5) || (silent * 20 >= 250 && secs >= 7) || (silent * 20 >= 2000)) return flushSeg();
+  if (secs >= 14) splitSeg();
+}
+// No pause for 14 s: cut at the quietest 200 ms of the last 3 s and keep the rest for the next segment,
+// so words are not chopped in half.
+function splitSeg() {
+  const W = 10, from = Math.max(W, pcm.length - 150);
+  let best = pcm.length - 1, bestE = Infinity;
+  for (let i = from; i <= pcm.length - W; i++) {
+    let e = 0; for (let j = i; j < i + W; j++) e += lv[j];
+    if (e < bestE) { bestE = e; best = i + (W >> 1); }
+  }
+  const restF = pcm.slice(best), restL = lv.slice(best);
+  pcm = pcm.slice(0, best);
+  const th = Math.max(noise * 3, 0.006);
+  flushSeg();
+  inSeg = true; pcm = restF; lv = restL; silent = 0; voiced = restL.filter(x => x > th).length;
 }
 function flushSeg() {
   const frames = pcm, v = voiced; resetSeg();
